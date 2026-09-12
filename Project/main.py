@@ -327,7 +327,7 @@ last_gaze_toggle_time = 0.0
 was_youtube_active = False
 
 # 0.5-second Gaze Buffer states
-gaze_buffered_state = "AWAY"    # "LOOKING" or "AWAY"
+gaze_buffered_state = None      # "LOOKING" or "AWAY" (None before first frame detection)
 gaze_candidate_state = None     # candidate state undergoing 0.5s debounce
 gaze_candidate_start = 0.0      # start timestamp of candidate state
 
@@ -640,8 +640,11 @@ while cap.isOpened():
     # --------------------------------------------------------------------------
     current_instant_gaze = "LOOKING" if raw_looking_at_screen else "AWAY"
 
-    # Debounce 0.5s buffer to ignore normal eye blinks
-    if current_instant_gaze != gaze_buffered_state:
+    # Initialize on first frame or debounce 0.5s buffer to ignore normal eye blinks
+    if gaze_buffered_state is None:
+        gaze_buffered_state = current_instant_gaze
+        gaze_candidate_state = None
+    elif current_instant_gaze != gaze_buffered_state:
         if gaze_candidate_state != current_instant_gaze:
             gaze_candidate_state = current_instant_gaze
             gaze_candidate_start = current_time
@@ -651,25 +654,45 @@ while cap.isOpened():
     else:
         gaze_candidate_state = None
 
-    # FEATURE 2: INVERSE ATTENTION TRAP (Look Away to Play)
+    # FEATURE 2: INVERSE ATTENTION TRAP (Look Away to Play) & AD ATTENTION ENFORCEMENT
     if ad_mode_active:
-        # Penalty Trigger: Look away > 1.0s continuously during ad
-        if not raw_looking_at_screen:
-            if ad_not_looking_start == 0.0:
-                ad_not_looking_start = current_time
-            else:
-                inattention_duration = current_time - ad_not_looking_start
-                if inattention_duration >= AD_LOOKAWAY_THRESHOLD_SEC:
-                    if (current_time - last_ad_penalty_time) >= AD_PENALTY_COOLDOWN_SEC:
-                        trigger_ad_penalty(current_time)
-                    ad_not_looking_start = 0.0
-        else:
+        can_toggle_gaze = (current_time - last_gaze_toggle_time) >= GAZE_TOGGLE_COOLDOWN
+
+        # Rule for Ads:
+        # Looking AT Screen -> Ad MUST RESUME (Play)
+        if gaze_buffered_state == "LOOKING":
             ad_not_looking_start = 0.0
+            if (video_state == "PAUSED" or video_state == "INITIAL") and can_toggle_gaze:
+                send_youtube_play_pause()
+                video_state = "PLAYING"
+                last_gaze_toggle_time = current_time
+                print("[+] AD MODE: Looking At Screen -> RESUMING AD PLAYBACK")
+
+        # Looking AWAY from Screen -> Ad MUST STOP (Pause) + Penalty Tax
+        elif gaze_buffered_state == "AWAY":
+            if (video_state == "PLAYING" or video_state == "INITIAL") and can_toggle_gaze:
+                send_youtube_play_pause()
+                video_state = "PAUSED"
+                last_gaze_toggle_time = current_time
+                print("[!] AD MODE: Looking Away -> AD PAUSED (STOPPED)")
+
+            # Penalty Trigger: Look away > 1.0s continuously during ad
+            if not raw_looking_at_screen:
+                if ad_not_looking_start == 0.0:
+                    ad_not_looking_start = current_time
+                else:
+                    inattention_duration = current_time - ad_not_looking_start
+                    if inattention_duration >= AD_LOOKAWAY_THRESHOLD_SEC:
+                        if (current_time - last_ad_penalty_time) >= AD_PENALTY_COOLDOWN_SEC:
+                            trigger_ad_penalty(current_time)
+                        ad_not_looking_start = 0.0
+            else:
+                ad_not_looking_start = 0.0
 
     elif inverse_attention_trap and (youtube_active_now or True):
         can_toggle_gaze = (current_time - last_gaze_toggle_time) >= GAZE_TOGGLE_COOLDOWN
 
-        # Rule 1: Looking AWAY from screen -> The video MUST PLAY
+        # Rule 1: Looking AWAY from screen -> The video MUST PLAY (Resume)
         if gaze_buffered_state == "AWAY":
             if (video_state == "PAUSED" or video_state == "INITIAL") and can_toggle_gaze:
                 send_youtube_play_pause()
@@ -677,7 +700,7 @@ while cap.isOpened():
                 last_gaze_toggle_time = current_time
                 print("[+] INVERSE ATTENTION: Looking Away -> RESUMING PLAYBACK (GOOD)")
 
-        # Rule 2: Looking DIRECTLY AT screen -> The video MUST PAUSE
+        # Rule 2: Looking DIRECTLY AT screen -> The video MUST PAUSE (Stop)
         elif gaze_buffered_state == "LOOKING":
             if (video_state == "PLAYING" or video_state == "INITIAL") and can_toggle_gaze:
                 send_youtube_play_pause()
@@ -836,8 +859,31 @@ while cap.isOpened():
         text_x = max(16, (frame_w - text_size[0]) // 2)
         cv2.putText(frame, ad_penalty_banner_text, (text_x, banner_y1 + 42), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2, cv2.LINE_AA)
 
-    # 2. INVERSE ATTENTION TRAP HUD STATUS (GREEN / RED)
-    if inverse_attention_trap and not ad_mode_active:
+    # 2. INVERSE ATTENTION / AD MODE HUD STATUS (GREEN / RED)
+    elif ad_mode_active:
+        if gaze_buffered_state == "LOOKING":
+            hud_gaze_text = "AD MODE: WATCHING AD (RESUMED/PLAYING)"
+            hud_gaze_bg = (0, 140, 0)
+            hud_gaze_border = (0, 255, 0)
+            hud_text_color = (255, 255, 255)
+        else:
+            hud_gaze_text = "AD MODE: LOOKING AWAY -> AD STOPPED/PAUSED!"
+            hud_gaze_bg = (0, 0, 180)
+            hud_gaze_border = (0, 0, 255)
+            hud_text_color = (255, 255, 255)
+
+        banner_y1 = 40
+        banner_y2 = 72
+        overlay_gaze = frame.copy()
+        cv2.rectangle(overlay_gaze, (10, banner_y1), (frame_w - 10, banner_y2), hud_gaze_bg, -1)
+        cv2.addWeighted(overlay_gaze, 0.85, frame, 0.15, 0, frame)
+        cv2.rectangle(frame, (10, banner_y1), (frame_w - 10, banner_y2), hud_gaze_border, 2)
+
+        ts = cv2.getTextSize(hud_gaze_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)[0]
+        tx = max(15, (frame_w - ts[0]) // 2)
+        cv2.putText(frame, hud_gaze_text, (tx, banner_y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, hud_text_color, 2, cv2.LINE_AA)
+
+    elif inverse_attention_trap:
         if gaze_buffered_state == "AWAY":
             hud_gaze_text = "LOOKING AWAY: PLAYING (GOOD)"
             hud_gaze_bg = (0, 140, 0)
@@ -871,7 +917,7 @@ while cap.isOpened():
         status_color = (0, 255, 255)
     elif ad_mode_active:
         cv2.rectangle(overlay_top, (0, 0), (frame_w, top_bar_h), (0, 80, 180), -1)
-        status_title = f"AD MODE: ACTIVE | STRIKES: {ad_strikes}/3"
+        status_title = f"AD MODE: ACTIVE ({video_state}) | STRIKES: {ad_strikes}/3"
         status_color = (0, 255, 255)
     elif inverse_attention_trap:
         cv2.rectangle(overlay_top, (0, 0), (frame_w, top_bar_h), (0, 100, 150), -1)
@@ -891,8 +937,12 @@ while cap.isOpened():
     cv2.putText(frame, "[M: Mouth | I: Inverse | A: Ad | F: Flip]", (frame_w - 320, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
 
     # Bottom status readouts
-    gaze_label = "LOOKING AT SCREEN (PAUSED)" if gaze_buffered_state == "LOOKING" else "LOOKING AWAY: (PLAYING)"
-    gaze_color = (0, 0, 255) if gaze_buffered_state == "LOOKING" else (0, 255, 0)
+    if ad_mode_active:
+        gaze_label = "LOOKING AT AD (RESUMED)" if gaze_buffered_state == "LOOKING" else "LOOKING AWAY (AD PAUSED)"
+        gaze_color = (0, 255, 0) if gaze_buffered_state == "LOOKING" else (0, 0, 255)
+    else:
+        gaze_label = "LOOKING AT SCREEN (PAUSED)" if gaze_buffered_state == "LOOKING" else "LOOKING AWAY: (PLAYING)"
+        gaze_color = (0, 0, 255) if gaze_buffered_state == "LOOKING" else (0, 255, 0)
     cv2.putText(frame, f"Gaze: {gaze_label}", (20, frame_h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, gaze_color, 1, cv2.LINE_AA)
     cv2.putText(frame, f"Scroll: {scroll_status_text}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.45, scroll_status_color, 1, cv2.LINE_AA)
 
@@ -941,7 +991,8 @@ while cap.isOpened():
             ad_strikes = 0
             ad_not_looking_start = 0.0
             ad_penalty_banner_text = ""
-        print(f"[*] YOUTUBE AD REWIND TAX MODE TOGGLED: {'ACTIVE' if ad_mode_active else 'OFF'}")
+        gaze_candidate_state = None
+        print(f"[*] YOUTUBE AD MODE TOGGLED: {'ACTIVE (Look at Ad to Play, Look Away to Pause)' if ad_mode_active else 'OFF (Inverse Attention Mode)'}")
     elif key == ord('r') or key == ord('R'):
         send_youtube_play_pause()
         video_state = "PLAYING" if video_state == "PAUSED" else "PAUSED"
