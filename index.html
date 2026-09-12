@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -173,21 +174,20 @@
         }
     </style>
 </head>
+
 <body>
 
     <div class="container">
         <header>
-            <h1>RagePipe</h1>
-            <p class="tagline">An adversarial computer vision controller that pranks your YouTube experience using nose tracking and gaze enforcement.</p>
+            <h1>LookAway</h1>
+            <p class="tagline">An computer vision controller that pranks your YouTube experience using nose tracking.
+            </p>
         </header>
 
         <div class="video-container">
-            <iframe 
-                src="https://www.youtube-nocookie.com/embed/gZrAWg5hlnY" 
-                title="RagePipe Demo Video" 
-                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" 
-                referrerpolicy="strict-origin-when-cross-origin" 
-                allowfullscreen>
+            <iframe src="https://www.youtube-nocookie.com/embed/gZrAWg5hlnY" title="RagePipe Demo Video"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                referrerpolicy="strict-origin-when-cross-origin" allowfullscreen>
             </iframe>
         </div>
 
@@ -197,7 +197,7 @@
                 <li><strong>Nose cursor</strong> controls your mouse</li>
                 <li><strong>Fullscreen</strong> flips the entire screen upside down</li>
                 <li><strong>Looking away</strong> pauses the video/ad instantly</li>
-                <li><strong>Liking a video</strong> forces a dislike and rewinds it to 0:00</li>
+
             </ul>
         </section>
 
@@ -207,17 +207,11 @@
                 <code>pip install opencv-python mediapipe pyautogui numpy</code>
                 <code>python main.py</code>
             </div>
-            <div class="hotkeys">
-                <div class="hotkey-badge"><kbd>Q</kbd> Quit</div>
-                <div class="hotkey-badge"><kbd>B</kbd> Toggle Button Rage</div>
-                <div class="hotkey-badge"><kbd>A</kbd> Toggle Ad Enforcer</div>
-            </div>
+
         </section>
 
-        <footer>
-            <p>RagePipe · Built for Hackathon</p>
-        </footer>
     </div>
 
 </body>
+
 </html>
