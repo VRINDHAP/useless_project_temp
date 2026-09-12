@@ -1,6 +1,6 @@
 # ==============================================================================
 # PIP INSTALLATION COMMAND:
-# pip install opencv-python mediapipe pyautogui numpy pygame
+# pip install opencv-python mediapipe pyautogui numpy
 # ==============================================================================
 
 import sys
@@ -13,13 +13,6 @@ import cv2
 import mediapipe as mp
 import pyautogui
 import numpy as np
-
-# Initialize Pygame Mixer for non-blocking asynchronous audio playback
-try:
-    import pygame
-    pygame.mixer.init()
-except Exception as e:
-    print(f"[!] Pygame mixer notice: {e}")
 
 # Force UTF-8 stdout if possible on Windows
 if sys.platform == "win32":
@@ -35,13 +28,14 @@ pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0
 SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
 
-# ------------------------------------------------------------------------------
-# FULLSCREEN INVERSION SUPPORT
-# ------------------------------------------------------------------------------
+# Fullscreen & Inversion Trap Global States
 fullscreen_inversion = False
 original_display_orientation = None
+_display_lock = threading.Lock()
 
-
+# ------------------------------------------------------------------------------
+# WINDOW, YOUTUBE & DISPLAY ROTATION HELPERS
+# ------------------------------------------------------------------------------
 def _get_foreground_window_details():
     """Returns the active window title, class, and screen rectangle on Windows."""
     if sys.platform != "win32":
@@ -74,10 +68,19 @@ def _get_foreground_window_details():
         return "", "", None
 
 
-def is_youtube_fullscreen():
-    """Detects a fullscreen YouTube browser window without requiring browser hooks."""
+def is_youtube_active():
+    """Detects if YouTube is open/active in the foreground browser automatically."""
     title, window_class, rect = _get_foreground_window_details()
-    if rect is None or title.lower().startswith(window_name.lower()):
+    title_lower = title.lower()
+    return "youtube" in title_lower or "youtu.be" in title_lower
+
+
+def is_youtube_fullscreen(current_window_name="Nose Cursor"):
+    """Detects if YouTube has entered a fullscreen window state."""
+    title, window_class, rect = _get_foreground_window_details()
+    if rect is None:
+        return False
+    if current_window_name and title.lower().startswith(current_window_name.lower()):
         return False
 
     fills_screen = (
@@ -88,8 +91,9 @@ def is_youtube_fullscreen():
         "Chrome_WidgetWin_1",
         "MozillaWindowClass",
         "ApplicationFrameWindow",
-    }
-    return fills_screen and browser_window and "youtube" in title.lower()
+    } or "chrome" in window_class.lower() or "firefox" in window_class.lower() or "edge" in window_class.lower()
+    
+    return fills_screen and (browser_window or "youtube" in title.lower()) and ("youtube" in title.lower() or "youtu.be" in title.lower())
 
 
 class _DisplayMode(ctypes.Structure):
@@ -128,7 +132,7 @@ class _DisplayMode(ctypes.Structure):
 
 
 def set_display_inverted(inverted):
-    """Attempts a 180-degree primary-display rotation and never raises."""
+    """Attempts a 180-degree primary-display rotation on Windows safely."""
     global original_display_orientation
     if sys.platform != "win32":
         return False
@@ -143,179 +147,148 @@ def set_display_inverted(inverted):
         if original_display_orientation is None:
             original_display_orientation = mode.dmDisplayOrientation
 
-        mode.dmDisplayOrientation = (
-            (original_display_orientation + 2) % 4
-            if inverted else original_display_orientation
-        )
+        # Rotate 180 degrees (add 2 mod 4)
+        target_orientation = ((original_display_orientation + 2) % 4) if inverted else original_display_orientation
+        mode.dmDisplayOrientation = target_orientation
         mode.dmFields = 0x00000080  # DM_DISPLAYORIENTATION
         result = user32.ChangeDisplaySettingsW(ctypes.byref(mode), 0)
         return result == 0
     except Exception as error:
-        print(f"[!] Display rotation unavailable; using software inversion only: {error}")
+        print(f"[!] Display rotation error: {error}")
         return False
 
 
 def update_fullscreen_inversion(active):
-    """Applies inversion once per state change; display rotation is best effort."""
+    """
+    Applies display rotation in a background daemon thread so the OpenCV
+    camera loop never freezes or drops below 30 FPS.
+    """
     global fullscreen_inversion
     if active == fullscreen_inversion:
         return
 
     fullscreen_inversion = active
-    rotated = set_display_inverted(active)
-    if active:
-        print(f"[!] FULLSCREEN INVERSION ACTIVATED (display rotation: {'yes' if rotated else 'software only'})")
-    else:
-        print("[+] Fullscreen inversion cleared.")
+
+    def _async_rotate():
+        with _display_lock:
+            rotated = set_display_inverted(active)
+            if active:
+                print(f"[!] FULLSCREEN INVERSION ACTIVATED: Display flipped 180° ({'Hardware OK' if rotated else 'Software active'})")
+            else:
+                print("[+] FULLSCREEN EXITED: Display restored to normal right-side up.")
+
+    threading.Thread(target=_async_rotate, daemon=True).start()
 
 # ------------------------------------------------------------------------------
 # 2. TUNING PARAMETERS & THRESHOLDS
 # ------------------------------------------------------------------------------
-# --- NOSE CURSOR TRACKING ---
-SMOOTHING_ALPHA = 0.22          # Smooth, calm cursor motion
-ACTIVE_X_MIN, ACTIVE_X_MAX = 0.20, 0.80  # Comfortable head navigation bounds
-ACTIVE_Y_MIN, ACTIVE_Y_MAX = 0.20, 0.80
+# --- ADAPTIVE NOSE CURSOR TRACKING (Full Screen, All 4 Corners & Bottommost Region) ---
+ACTIVE_X_MIN, ACTIVE_X_MAX = 0.35, 0.65  # Natural horizontal tilt reaches left and right edges easily
+ACTIVE_Y_MIN, ACTIVE_Y_MAX = 0.36, 0.56  # Natural vertical tilt reaches top and bottommost taskbar easily
 
-# --- MOUTH-OPEN CLICK GESTURE ---
-MOUTH_OPEN_THRESHOLD = 0.38     # Normalized vertical lip ratio
-CLICK_COOLDOWN_SECONDS = 1.2    # Cooldown between clicks
-CLICK_FLASH_DURATION = 0.35     # Visual flash duration
+# --- MOUTH-OPEN CLICK GESTURE (Normalized by Face Height for Yaw Invariance) ---
+mouth_click_enabled = True      # Enabled by default (Toggle with 'm')
+MOUTH_OPEN_THRESHOLD = 0.14     # Deliberate open-mouth threshold normalized by face height
+CLICK_COOLDOWN_SECONDS = 1.0    # Cooldown between clicks
+CLICK_FLASH_DURATION = 0.30     # Visual flash duration
 
-# --- 2-SPEED VIRTUAL BUTTON SCROLLER ---
-BUTTON_X_MIN, BUTTON_X_MAX = 0.65, 0.98
-FAST_UP_Y_MIN, FAST_UP_Y_MAX     = 0.05, 0.22   # "FAST UP"
-SLOW_UP_Y_MIN, SLOW_UP_Y_MAX     = 0.24, 0.42   # "SLOW UP"
-SLOW_DOWN_Y_MIN, SLOW_DOWN_Y_MAX = 0.58, 0.76   # "SLOW DOWN"
-FAST_DOWN_Y_MIN, FAST_DOWN_Y_MAX = 0.78, 0.95   # "FAST DOWN"
+# --- 2-SPEED VIRTUAL BUTTON SCROLLER (RIGHT SIDE OF CAMERA) ---
+# (DOWN Buttons Above, UP Buttons Below)
+BUTTON_X_MIN, BUTTON_X_MAX = 0.68, 0.98
+FAST_DOWN_Y_MIN, FAST_DOWN_Y_MAX = 0.08, 0.24   # "FAST DOWN" (Top)
+SLOW_DOWN_Y_MIN, SLOW_DOWN_Y_MAX = 0.26, 0.42   # "SLOW DOWN" (Upper)
+SLOW_UP_Y_MIN, SLOW_UP_Y_MAX     = 0.58, 0.74   # "SLOW UP" (Lower)
+FAST_UP_Y_MIN, FAST_UP_Y_MAX     = 0.76, 0.92   # "FAST UP" (Bottom)
 
-SLOW_SCROLL_SPEED = 40          # Gentle reading scroll
-FAST_SCROLL_SPEED = 120         # Turbo scroll
-SCROLL_INTERVAL = 0.08          # Timed interval between scroll ticks
+SLOW_SCROLL_SPEED = 45          # Smooth reading scroll
+FAST_SCROLL_SPEED = 130         # Turbo scroll
+SCROLL_INTERVAL = 0.06          # Fluid scroll tick interval
 
-# --- YOUTUBE PRANK MODE CONFIGURATION ---
-PRANK_MODE_DEFAULT = True       # Starts Enabled (Toggle with 'r')
-LOOKING_FRAME_BUFFER = 4        # Debounce buffer frames (~0.12s) for clean transition
-JERK_COOLDOWN_SECONDS = 3.0     # 3-second cooldown on sneeze/head jerk restart
-JERK_DOWNWARD_VELOCITY_THRESH = 0.65  # Normalized downward speed threshold
-JERK_DISPLACEMENT_THRESH = 0.06       # Sudden delta y threshold
+# --- INVERSE ATTENTION TRAP & GAZE BUFFER SETTINGS ---
+inverse_attention_trap = True   # Enabled by default (Toggle with 'i' / 'I')
+GAZE_BUFFER_SECONDS = 0.50      # 0.5-second buffer so normal eye blinks do not spam 'k'
+GAZE_TOGGLE_COOLDOWN = 0.40     # 400ms cooldown between play/pause toggles
+
+# --- YOUTUBE AD REWIND TAX CONFIGURATION ---
+ad_mode_active = False          # Toggle with 'a' / 'A'
+ad_strikes = 0
+ad_not_looking_start = 0.0
+last_ad_penalty_time = 0.0
+ad_penalty_banner_text = ""
+ad_penalty_banner_until = 0.0
+AD_LOOKAWAY_THRESHOLD_SEC = 1.0
+AD_PENALTY_COOLDOWN_SEC = 2.0
 
 # ------------------------------------------------------------------------------
-# 3. GLOBAL SINGLE-EVENT MEDIA & VIDEO CONTROLLER
+# 3. GLOBAL CLEAN MEDIA & VIDEO CONTROLLER
 # ------------------------------------------------------------------------------
-def toggle_media_play_pause():
+def send_youtube_play_pause():
     """
-    Sends a SINGLE clean hardware Media Play/Pause toggle event (VK_MEDIA_PLAY_PAUSE = 0xB3).
-    Works globally on Windows across Chrome, Edge, Brave, and Firefox even when
-    the OpenCV webcam window is currently focused.
+    Sends clean play/pause events directly to YouTube without clicking anything.
+    Uses 'k' (standard universal YouTube shortcut) in a background thread to maintain >30 FPS.
     """
-    try:
-        if sys.platform == "win32":
-            VK_MEDIA_PLAY_PAUSE = 0xB3
-            ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, 0)
-            time.sleep(0.01)
-            ctypes.windll.user32.keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 2, 0)
-        else:
+    def _send():
+        try:
             pyautogui.press('k')
-    except Exception:
-        pyautogui.press('k')
-
-def restart_youtube_video():
-    """
-    Restarts the YouTube video to 0:00 by sending shortcut '0' / 'home'.
-    """
-    try:
-        pyautogui.press('0')
-        pyautogui.press('home')
-    except Exception:
-        pass
+        except Exception:
+            try:
+                if sys.platform == "win32":
+                    VK_K = 0x4B
+                    scan = ctypes.windll.user32.MapVirtualKeyW(VK_K, 0)
+                    ctypes.windll.user32.keybd_event(VK_K, scan, 0, 0)
+                    time.sleep(0.02)
+                    ctypes.windll.user32.keybd_event(VK_K, scan, 2, 0)
+            except Exception:
+                pass
+    threading.Thread(target=_send, daemon=True).start()
 
 # ------------------------------------------------------------------------------
-# 4. ASSET MANAGEMENT & AUDIO PIPELINE (WITH CRASH-PROOF FALLBACKS)
+# 4. PATHS & INITIALIZATION
 # ------------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(__file__)
-ASSETS_DIR = os.path.join(SCRIPT_DIR, 'assets')
-os.makedirs(ASSETS_DIR, exist_ok=True)
-
-def load_png(filename):
-    """Loads a 4-channel PNG with alpha transparency from assets/."""
-    try:
-        path = os.path.join(ASSETS_DIR, filename)
-        if os.path.exists(path):
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-            if img is not None:
-                return img
-    except Exception:
-        pass
-    return None
-
-judge_cat_img = load_png('judge_cat.png')
-happy_cat_img = load_png('happy_cat.png')
-shocked_cat_img = load_png('shocked_cat.png')
-
-def play_sound_async(sound_name):
-    """Plays audio on a non-blocking daemon thread so webcam frames never drop."""
-    def _play():
-        try:
-            path = os.path.join(ASSETS_DIR, sound_name)
-            if os.path.exists(path):
-                if 'pygame' in sys.modules and pygame.mixer.get_init():
-                    sound = pygame.mixer.Sound(path)
-                    sound.play()
-                    return
-            if sys.platform == "win32":
-                import winsound
-                winsound.Beep(880, 150)
-        except Exception:
-            pass
-    threading.Thread(target=_play, daemon=True).start()
-
-def overlay_png(frame, overlay_img, x, y, target_w=None, target_h=None, fallback_label="MEME CAT"):
-    """
-    Cleanly alpha-blends a 4-channel PNG over the OpenCV BGR frame.
-    If image is missing, draws a crash-proof stylish cartoon fallback box.
-    """
-    h_frame, w_frame = frame.shape[:2]
-    tw = int(target_w) if target_w is not None else 180
-    th = int(target_h) if target_h is not None else 180
-
-    if overlay_img is None:
-        bx1, by1 = max(0, x), max(0, y)
-        bx2, by2 = min(w_frame, x + tw), min(h_frame, y + th)
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (40, 40, 40), -1)
-        cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 255), 2)
-        cv2.putText(frame, fallback_label, (bx1 + 10, by1 + th // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
-        return frame
-
-    if target_w is not None and target_h is not None:
-        overlay = cv2.resize(overlay_img, (tw, th), interpolation=cv2.INTER_AREA)
-    else:
-        overlay = overlay_img
-
-    h_ov, w_ov = overlay.shape[:2]
-    x1, y1 = max(0, x), max(0, y)
-    x2, y2 = min(w_frame, x + w_ov), min(h_frame, y + h_ov)
-
-    if x1 >= x2 or y1 >= y2:
-        return frame
-
-    ov_x1, ov_y1 = max(0, -x), max(0, -y)
-    ov_x2, ov_y2 = ov_x1 + (x2 - x1), ov_y1 + (y2 - y1)
-
-    overlay_crop = overlay[ov_y1:ov_y2, ov_x1:ov_x2]
-    frame_crop = frame[y1:y2, x1:x2]
-
-    if overlay_crop.shape[2] == 4:
-        alpha = (overlay_crop[:, :, 3] / 255.0)[:, :, np.newaxis]
-        bgr = overlay_crop[:, :, :3]
-        blended = (bgr * alpha + frame_crop * (1.0 - alpha)).astype(np.uint8)
-        frame[y1:y2, x1:x2] = blended
-    else:
-        frame[y1:y2, x1:x2] = overlay_crop[:, :, :3]
-
-    return frame
 
 # ------------------------------------------------------------------------------
-# 5. STATE MEMORY VARIABLES
+# 5. AD REWIND TAX EXECUTOR
+# ------------------------------------------------------------------------------
+def trigger_ad_penalty(current_time):
+    """
+    The Ad Rewind Tax:
+    - Strike 1 & 2: Inattention > 1s rewinds ad backward 5-10s ('left' twice).
+    - Strike 3: Total reset to 0:00 ('0' / 'home') and resets strike count.
+    """
+    global ad_strikes, last_ad_penalty_time, ad_penalty_banner_text, ad_penalty_banner_until
+    last_ad_penalty_time = current_time
+    ad_strikes += 1
+
+    if ad_strikes < 3:
+        ad_penalty_banner_text = f"ATTENTION BREACH: REWINDING SPONSOR MESSAGE (+5s) [STRIKES: {ad_strikes}/3]"
+        ad_penalty_banner_until = current_time + 3.0
+
+        def _rewind_ad():
+            try:
+                pyautogui.press('left', presses=2, interval=0.04)
+            except Exception as e:
+                print(f"[!] Ad rewind error: {e}")
+
+        threading.Thread(target=_rewind_ad, daemon=True).start()
+        print(f"[!] AD PENALTY (Strike {ad_strikes}/3): Inattention detected! Rewound ad backward by 5-10s.")
+    else:
+        ad_penalty_banner_text = "STRIKE 3! AD FULLY RESTARTED FOR DISRESPECT."
+        ad_penalty_banner_until = current_time + 3.5
+        ad_strikes = 0
+
+        def _restart_ad():
+            try:
+                pyautogui.press('0')
+                pyautogui.press('home')
+            except Exception as e:
+                print(f"[!] Ad restart error: {e}")
+
+        threading.Thread(target=_restart_ad, daemon=True).start()
+        print("[!] AD PENALTY (STRIKE 3 TOTAL RESET): Ad fully restarted to 0:00!")
+
+# ------------------------------------------------------------------------------
+# 6. STATE MEMORY VARIABLES
 # ------------------------------------------------------------------------------
 smoothed_x = SCREEN_WIDTH / 2
 smoothed_y = SCREEN_HEIGHT / 2
@@ -327,30 +300,29 @@ last_click_time = 0.0
 click_flash_until = 0.0
 last_scroll_time = 0.0
 
-# Prank Mode states
-prank_active = PRANK_MODE_DEFAULT
+# Automatic Gaze & Buffer states
 video_state = "INITIAL"
-looking_counter = 0
-not_looking_counter = 0
-happy_cat_until = 0.0
+last_gaze_toggle_time = 0.0
+was_youtube_active = False
 
-# Head Jerk / Sneeze detection state
-prev_nose_y = None
-prev_pose_time = 0.0
-last_jerk_time = 0.0
-jerk_alert_until = 0.0
+# 0.5-second Gaze Buffer states
+gaze_buffered_state = "AWAY"    # "LOOKING" or "AWAY"
+gaze_candidate_state = None     # candidate state undergoing 0.5s debounce
+gaze_candidate_start = 0.0      # start timestamp of candidate state
 
 # ------------------------------------------------------------------------------
-# 6. INITIALIZE MEDIAPIPE FACE MESH & HAND DETECTORS
+# 7. INITIALIZE MEDIAPIPE FACE MESH & HAND DETECTORS
 # ------------------------------------------------------------------------------
 print("=" * 65)
-print("  [*] NOSE CURSOR + 2-SPEED SCROLLER + YOUTUBE PRANK MODE")
+print("  [*] NOSE CURSOR + 2-SPEED SCROLLER + INVERSE ATTENTION + INVERSION")
 print("=" * 65)
-print(f"[*] Screen Resolution: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
-print(f"[*] YouTube Prank Mode: {'ACTIVE' if prank_active else 'OFF'} (Press 'r' to toggle)")
-print("[*] RULE 1: Watch Screen -> Look away pauses video ('LOOK AT THE SCREEN!')")
-print("[*] RULE 2: No Sneeze/Jerks -> Sudden jerk restarts video to 0:00")
-print("[*] Hotkeys: Press 'r' to toggle prank mode | 'q' to exit.")
+print(f"[*] Screen Resolution:       {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
+print(f"[*] Click Using Mouth:        {'ENABLED' if mouth_click_enabled else 'DISABLED'} (Press 'm' to toggle)")
+print(f"[*] YouTube Ad Mode:          {'ACTIVE' if ad_mode_active else 'OFF'} (Press 'a' to toggle)")
+print(f"[*] Inverse Attention Trap:   {'ON' if inverse_attention_trap else 'OFF'} (Press 'i' to toggle)")
+print(f"[*] Fullscreen Inversion Trap: ACTIVE ON FULLSCREEN (Press 'f' / 'Esc' to exit)")
+print("[*] Controls: Move nose to steer, open mouth to click, hover right boxes to scroll.")
+print("[*] Hotkeys: [M: Mouth Click | A: Ad Mode | I: Inverse Attention | F/Esc: Fullscreen | R: Resync | Q: Exit]")
 print("=" * 65)
 
 class VisionPipeline:
@@ -424,6 +396,8 @@ class VisionPipeline:
                     'chin': (lms[152].x, lms[152].y),
                     'upper_lip': (lms[13].x, lms[13].y),
                     'lower_lip': (lms[14].x, lms[14].y),
+                    'outer_upper_lip': (lms[0].x, lms[0].y),
+                    'outer_lower_lip': (lms[17].x, lms[17].y),
                     'left_eye': (lms[33].x, lms[33].y),
                     'right_eye': (lms[263].x, lms[263].y),
                 }
@@ -438,6 +412,8 @@ class VisionPipeline:
                     'chin': (lms[152].x, lms[152].y),
                     'upper_lip': (lms[13].x, lms[13].y),
                     'lower_lip': (lms[14].x, lms[14].y),
+                    'outer_upper_lip': (lms[0].x, lms[0].y),
+                    'outer_lower_lip': (lms[17].x, lms[17].y),
                     'left_eye': (lms[33].x, lms[33].y),
                     'right_eye': (lms[263].x, lms[263].y),
                 }
@@ -468,7 +444,7 @@ class VisionPipeline:
 pipeline = VisionPipeline()
 
 # ------------------------------------------------------------------------------
-# 7. INITIALIZE WEBCAM
+# 8. INITIALIZE WEBCAM
 # ------------------------------------------------------------------------------
 print("[*] Connecting to webcam...")
 
@@ -477,9 +453,12 @@ def open_camera():
     for index, backend in backends:
         cap = cv2.VideoCapture(index, backend)
         if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
             ret, test_frame = cap.read()
             if ret and test_frame is not None:
-                print(f"[+] Webcam detected and opened successfully on camera index {index}!")
+                print(f"[+] Webcam detected and opened successfully on camera index {index} (640x480 @ 30FPS)!")
                 return cap
             cap.release()
     return None
@@ -490,25 +469,22 @@ if cap is None:
     print("[!] ERROR: Could not access any webcam.")
     sys.exit(1)
 
-window_name = "Nose Cursor - YouTube Meme Prank Suite"
+window_name = "Nose Cursor - YouTube Smart Assistant"
 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(window_name, 720, 540)
 
-print("[*] Tracking Target: Nose Tip (Landmark 1)")
-print("[*] Controls: Move nose to steer, open mouth to click, hover right boxes to scroll.")
-print("[*] Mode: Look at screen to play | Look away to pause | Sneeze/jerk restarts video")
-print("[*] Press 'r' to toggle prank mode ON/OFF | Press 'q' to exit.")
-print("=" * 65)
-
 # ------------------------------------------------------------------------------
-# 8. HELPER MATH FUNCTIONS
+# 9. HELPER MATH FUNCTIONS
 # ------------------------------------------------------------------------------
 def euclidean_distance(pt1, pt2):
     return np.sqrt((pt1[0] - pt2[0]) ** 2 + (pt1[1] - pt2[1]) ** 2)
 
 # ------------------------------------------------------------------------------
-# 9. MAIN CONTINUOUS REAL-TIME TRACKING & PRANK LOOP
+# 10. MAIN CONTINUOUS REAL-TIME TRACKING LOOP
 # ------------------------------------------------------------------------------
+last_yt_check_time = 0.0
+youtube_active_now = False
+
 while cap.isOpened():
     success, frame = cap.read()
     if not success:
@@ -516,7 +492,31 @@ while cap.isOpened():
         continue
 
     current_time = time.time()
-    update_fullscreen_inversion(is_youtube_fullscreen())
+
+    # Throttled YouTube Active & Fullscreen Check (Runs every 0.10s for instant response)
+    if current_time - last_yt_check_time >= 0.10:
+        youtube_active_now = is_youtube_active()
+        if youtube_active_now and not was_youtube_active:
+            video_state = "INITIAL"
+            gaze_candidate_state = None
+        was_youtube_active = youtube_active_now
+
+        # Auto-detect fullscreen vs normal/closed/back state
+        yt_is_fullscreen = youtube_active_now and is_youtube_fullscreen(window_name)
+        if yt_is_fullscreen:
+            if not fullscreen_inversion:
+                update_fullscreen_inversion(True)
+        else:
+            # When back is clicked, video closed, or fullscreen exited -> return to straight normal
+            if fullscreen_inversion:
+                update_fullscreen_inversion(False)
+
+        last_yt_check_time = current_time
+
+    # Instant Global Escape Key Check (Reverts to normal immediately if pressed anywhere)
+    if sys.platform == "win32" and fullscreen_inversion:
+        if (ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000) != 0:
+            update_fullscreen_inversion(False)
 
     # STEP A: Flip frame horizontally for intuitive mirror-like navigation
     frame = cv2.flip(frame, 1)
@@ -530,31 +530,20 @@ while cap.isOpened():
     hand_found, index_tip, all_hand_lms = pipeline.process_hand(rgb_frame)
 
     raw_looking_at_screen = False
+    mouth_open_ratio = 0.0
+
+    # Normalized camera coordinates of the nose dot
+    norm_cam_x, norm_cam_y = 0.5, 0.5
 
     # --------------------------------------------------------------------------
-    # STEP C: NOSE TRACKING, GAZE POSE & SNEEZE/JERK DETECTION
+    # STEP C: GAZE ORIENTATION & POSE CHECK
     # --------------------------------------------------------------------------
     if face_found:
         nose_norm = face_landmarks['nose']
-        norm_x, norm_y = nose_norm
+        norm_cam_x, norm_cam_y = nose_norm
 
-        # 1. Coordinate Mapping using np.interp
-        cursor_x_targets = [SCREEN_WIDTH, 0] if fullscreen_inversion else [0, SCREEN_WIDTH]
-        cursor_y_targets = [SCREEN_HEIGHT, 0] if fullscreen_inversion else [0, SCREEN_HEIGHT]
-        raw_screen_x = np.interp(norm_x, [ACTIVE_X_MIN, ACTIVE_X_MAX], cursor_x_targets)
-        raw_screen_y = np.interp(norm_y, [ACTIVE_Y_MIN, ACTIVE_Y_MAX], cursor_y_targets)
-        raw_screen_x = np.clip(raw_screen_x, 0, SCREEN_WIDTH - 1)
-        raw_screen_y = np.clip(raw_screen_y, 0, SCREEN_HEIGHT - 1)
-
-        # 2. Exponential Moving Average (EMA) Smoothing
-        smoothed_x = (smoothed_x * (1.0 - SMOOTHING_ALPHA)) + (raw_screen_x * SMOOTHING_ALPHA)
-        smoothed_y = (smoothed_y * (1.0 - SMOOTHING_ALPHA)) + (raw_screen_y * SMOOTHING_ALPHA)
-        last_known_x, last_known_y = smoothed_x, smoothed_y
-
-        # Move system mouse cursor
-        pyautogui.moveTo(int(smoothed_x), int(smoothed_y))
-
-        # 3. Head Orientation & Gaze Pose Detection
+        # Distances for Orientation & Scale
+        forehead_to_chin = euclidean_distance(face_landmarks['forehead'], face_landmarks['chin'])
         forehead_to_nose = euclidean_distance(face_landmarks['forehead'], face_landmarks['nose'])
         nose_to_chin = euclidean_distance(face_landmarks['nose'], face_landmarks['chin'])
         nose_to_left_eye = euclidean_distance(face_landmarks['nose'], face_landmarks['left_eye'])
@@ -563,81 +552,120 @@ while cap.isOpened():
         pitch_ratio = forehead_to_nose / max(nose_to_chin, 1e-6)
         yaw_symmetry = min(nose_to_left_eye, nose_to_right_eye) / max(max(nose_to_left_eye, nose_to_right_eye), 1e-6)
 
-        # Looking forward at the screen:
-        if 0.60 <= pitch_ratio <= 1.80 and yaw_symmetry >= 0.40:
+        # STRICT LOOKING FORWARD AT SCREEN CHECK:
+        # Looking straight ahead / down at taskbar: yaw_symmetry >= 0.68, pitch 0.55 to 1.90
+        # If user looks away/right/outside: yaw_symmetry drops significantly
+        if (0.55 <= pitch_ratio <= 1.90) and (yaw_symmetry >= 0.68):
             raw_looking_at_screen = True
         else:
             raw_looking_at_screen = False
 
-        # 4. Sneeze / Sudden Downward Head Jerk Detection
-        if prev_nose_y is not None and prev_pose_time > 0:
-            dt = max(current_time - prev_pose_time, 1e-4)
-            dy = norm_y - prev_nose_y
-            downward_speed = dy / dt
+        # Calculate mouth opening normalized by face height (invariant to head yaw rotation)
+        lip_inner_dist = euclidean_distance(face_landmarks['upper_lip'], face_landmarks['lower_lip'])
+        mouth_open_ratio = lip_inner_dist / max(forehead_to_chin, 1e-6)
 
-            # If sudden downward movement / sneeze / jerk detected
-            if (downward_speed >= JERK_DOWNWARD_VELOCITY_THRESH or dy >= JERK_DISPLACEMENT_THRESH):
-                if prank_active and (current_time - last_jerk_time) >= JERK_COOLDOWN_SECONDS:
-                    last_jerk_time = current_time
-                    jerk_alert_until = current_time + 2.5
-                    restart_youtube_video()
-                    play_sound_async('banana_cat_cry.mp3')
-                    print("[!] SNEEZE / HEAD JERK DETECTED! Restarting YouTube video to 0:00...")
+        # ----------------------------------------------------------------------
+        # CURSOR STEERING (NORMAL VS INVERTED DIRECTION TRAP)
+        # ----------------------------------------------------------------------
+        if raw_looking_at_screen:
+            if fullscreen_inversion:
+                # FEATURE 1 PUNISHMENT: Inverted nose-cursor controls
+                # Moving head UP moves cursor DOWN, moving LEFT moves it RIGHT
+                raw_screen_x = np.interp(norm_cam_x, [ACTIVE_X_MIN, ACTIVE_X_MAX], [SCREEN_WIDTH - 1, 0])
+                raw_screen_y = np.interp(norm_cam_y, [ACTIVE_Y_MIN, ACTIVE_Y_MAX], [SCREEN_HEIGHT - 1, 0])
+            else:
+                # Standard intuitive navigation: All 4 corners
+                raw_screen_x = np.interp(norm_cam_x, [ACTIVE_X_MIN, ACTIVE_X_MAX], [0, SCREEN_WIDTH - 1])
+                raw_screen_y = np.interp(norm_cam_y, [ACTIVE_Y_MIN, ACTIVE_Y_MAX], [0, SCREEN_HEIGHT - 1])
 
-        prev_nose_y = norm_y
-        prev_pose_time = current_time
+            raw_screen_x = np.clip(raw_screen_x, 0, SCREEN_WIDTH - 1)
+            raw_screen_y = np.clip(raw_screen_y, 0, SCREEN_HEIGHT - 1)
 
-        # 5. Mouth-Open Click Gesture
-        lip_vertical_dist = euclidean_distance(face_landmarks['upper_lip'], face_landmarks['lower_lip'])
-        eye_dist = euclidean_distance(face_landmarks['left_eye'], face_landmarks['right_eye'])
-        mouth_open_ratio = lip_vertical_dist / max(eye_dist, 1e-6)
+            # Continuous Exponential Velocity Filter (Smooth & Jitter-Free)
+            delta_dist = np.sqrt((raw_screen_x - smoothed_x) ** 2 + (raw_screen_y - smoothed_y) ** 2)
+            adaptive_alpha = 0.18 + 0.47 * (1.0 - np.exp(-delta_dist / 45.0))
+            
+            smoothed_x = (smoothed_x * (1.0 - adaptive_alpha)) + (raw_screen_x * adaptive_alpha)
+            smoothed_y = (smoothed_y * (1.0 - adaptive_alpha)) + (raw_screen_y * adaptive_alpha)
+            last_known_x, last_known_y = smoothed_x, smoothed_y
 
-        can_click = (current_time - last_click_time) >= CLICK_COOLDOWN_SECONDS
-        if mouth_open_ratio >= MOUTH_OPEN_THRESHOLD and can_click:
-            pyautogui.click(int(smoothed_x), int(smoothed_y))
-            last_click_time = current_time
-            click_flash_until = current_time + CLICK_FLASH_DURATION
+            # Move system mouse cursor with 0ms Win32 hardware direct call
+            if sys.platform == "win32":
+                ctypes.windll.user32.SetCursorPos(int(smoothed_x), int(smoothed_y))
+            else:
+                pyautogui.moveTo(int(smoothed_x), int(smoothed_y))
+
+            # Mouth-Open Click Gesture
+            can_click = (current_time - last_click_time) >= CLICK_COOLDOWN_SECONDS
+            if mouth_click_enabled and (mouth_open_ratio >= MOUTH_OPEN_THRESHOLD) and can_click and (yaw_symmetry >= 0.78):
+                pyautogui.click(int(smoothed_x), int(smoothed_y))
+                last_click_time = current_time
+                click_flash_until = current_time + CLICK_FLASH_DURATION
+                print(f"[+] MOUTH CLICK TRIGGERED! (Ratio: {mouth_open_ratio:.2f})")
 
         # Visual feedback: Nose dot
-        nose_pixel_x, nose_pixel_y = int(norm_x * frame_w), int(norm_y * frame_h)
+        nose_pixel_x, nose_pixel_y = int(norm_cam_x * frame_w), int(norm_cam_y * frame_h)
         is_flash_active = current_time < click_flash_until
         dot_color = (0, 0, 255) if is_flash_active else (0, 255, 0)
         cv2.circle(frame, (nose_pixel_x, nose_pixel_y), 8, dot_color, -1)
         cv2.circle(frame, (nose_pixel_x, nose_pixel_y), 14, (0, 255, 255), 2)
 
     else:
-        # Face not detected -> user is definitely looking away / stepped away
+        # Face not detected -> user is looking away / stepped away
         raw_looking_at_screen = False
-        prev_nose_y = None
 
     # --------------------------------------------------------------------------
-    # STEP D: "WATCH THE SCREEN" PRANK RULE STATE MACHINE
+    # STEP D: 0.5-SECOND BUFFERED GAZE STATE TRACKER & PLAYBACK CONTROLLER
     # --------------------------------------------------------------------------
-    if prank_active:
-        if raw_looking_at_screen:
-            looking_counter += 1
-            not_looking_counter = 0
+    current_instant_gaze = "LOOKING" if raw_looking_at_screen else "AWAY"
+
+    # Debounce 0.5s buffer to ignore normal eye blinks
+    if current_instant_gaze != gaze_buffered_state:
+        if gaze_candidate_state != current_instant_gaze:
+            gaze_candidate_state = current_instant_gaze
+            gaze_candidate_start = current_time
+        elif (current_time - gaze_candidate_start) >= GAZE_BUFFER_SECONDS:
+            gaze_buffered_state = current_instant_gaze
+            gaze_candidate_state = None
+    else:
+        gaze_candidate_state = None
+
+    # FEATURE 2: INVERSE ATTENTION TRAP (Look Away to Play)
+    if ad_mode_active:
+        # Penalty Trigger: Look away > 1.0s continuously during ad
+        if not raw_looking_at_screen:
+            if ad_not_looking_start == 0.0:
+                ad_not_looking_start = current_time
+            else:
+                inattention_duration = current_time - ad_not_looking_start
+                if inattention_duration >= AD_LOOKAWAY_THRESHOLD_SEC:
+                    if (current_time - last_ad_penalty_time) >= AD_PENALTY_COOLDOWN_SEC:
+                        trigger_ad_penalty(current_time)
+                    ad_not_looking_start = 0.0
         else:
-            not_looking_counter += 1
-            looking_counter = 0
+            ad_not_looking_start = 0.0
 
-        # Looking Away -> Automatically PAUSE YouTube video
-        if not_looking_counter >= LOOKING_FRAME_BUFFER and video_state != "PAUSED":
-            toggle_media_play_pause()
-            play_sound_async('huh_cat.mp3')
-            video_state = "PAUSED"
-            print("[!] PRANK RULE: LOOKED AWAY! YouTube PAUSED.")
+    elif inverse_attention_trap and (youtube_active_now or True):
+        can_toggle_gaze = (current_time - last_gaze_toggle_time) >= GAZE_TOGGLE_COOLDOWN
 
-        # Looking Back at Screen -> Automatically UNPAUSE YouTube video & show happy cat
-        elif looking_counter >= LOOKING_FRAME_BUFFER and video_state != "PLAYING":
-            toggle_media_play_pause()
-            play_sound_async('happy_cat.mp3')
-            happy_cat_until = current_time + 1.5
-            video_state = "PLAYING"
-            print("[+] PRANK RULE: LOOKED BACK! YouTube RESUMED.")
+        # Rule 1: Looking AWAY from screen -> The video MUST PLAY
+        if gaze_buffered_state == "AWAY":
+            if (video_state == "PAUSED" or video_state == "INITIAL") and can_toggle_gaze:
+                send_youtube_play_pause()
+                video_state = "PLAYING"
+                last_gaze_toggle_time = current_time
+                print("[+] INVERSE ATTENTION: Looking Away -> RESUMING PLAYBACK (GOOD)")
+
+        # Rule 2: Looking DIRECTLY AT screen -> The video MUST PAUSE
+        elif gaze_buffered_state == "LOOKING":
+            if (video_state == "PLAYING" or video_state == "INITIAL") and can_toggle_gaze:
+                send_youtube_play_pause()
+                video_state = "PAUSED"
+                last_gaze_toggle_time = current_time
+                print("[!] INVERSE ATTENTION: Looking At Screen FORBIDDEN -> PAUSED!")
 
     # --------------------------------------------------------------------------
-    # STEP E: 2-SPEED VIRTUAL BUTTON SCROLL ZONE SYSTEM
+    # STEP E: 2-SPEED VIRTUAL BUTTON SCROLL ZONE SYSTEM (RIGHT SIDE)
     # --------------------------------------------------------------------------
     btn_x1, btn_x2 = int(BUTTON_X_MIN * frame_w), int(BUTTON_X_MAX * frame_w)
     fup_y1, fup_y2     = int(FAST_UP_Y_MIN * frame_h), int(FAST_UP_Y_MAX * frame_h)
@@ -684,40 +712,63 @@ while cap.isOpened():
         scroll_status_text, scroll_status_color = "IDLE", (180, 180, 180)
 
     # --------------------------------------------------------------------------
-    # STEP F: RENDER BUTTONS & HAND HUD
+    # STEP F: RENDER MOUTH-CLICK & SCROLL BUTTON HUD
     # --------------------------------------------------------------------------
-    btn_overlay = frame.copy()
+    hud_overlay = frame.copy()
 
-    def render_button(y1, y2, is_active, active_bg=(0, 220, 0)):
+    # 1. "CLICK USING YOUR MOUTH" Status Box (Top-Left)
+    mc_bx1, mc_by1 = int(0.02 * frame_w), int(0.08 * frame_h)
+    mc_bx2, mc_by2 = int(0.48 * frame_w), int(0.18 * frame_h)
+
+    if mouth_click_enabled:
+        cv2.rectangle(hud_overlay, (mc_bx1, mc_by1), (mc_bx2, mc_by2), (0, 150, 0), -1)
+        cv2.rectangle(frame, (mc_bx1, mc_by1), (mc_bx2, mc_by2), (0, 255, 0), 2)
+        cv2.putText(frame, "CLICK USING MOUTH: ON", (mc_bx1 + 10, mc_by1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # Live Real-time Mouth Meter
+        meter_w = mc_bx2 - mc_bx1 - 20
+        fill_w = int(np.clip((mouth_open_ratio / (MOUTH_OPEN_THRESHOLD * 1.5)), 0.0, 1.0) * meter_w)
+        cv2.rectangle(frame, (mc_bx1 + 10, mc_by1 + 30), (mc_bx1 + 10 + meter_w, mc_by1 + 42), (50, 50, 50), -1)
+        bar_color = (0, 255, 0) if mouth_open_ratio >= MOUTH_OPEN_THRESHOLD else (0, 200, 255)
+        cv2.rectangle(frame, (mc_bx1 + 10, mc_by1 + 30), (mc_bx1 + 10 + fill_w, mc_by1 + 42), bar_color, -1)
+        thresh_x = mc_bx1 + 10 + int((MOUTH_OPEN_THRESHOLD / (MOUTH_OPEN_THRESHOLD * 1.5)) * meter_w)
+        cv2.line(frame, (thresh_x, mc_by1 + 28), (thresh_x, mc_by1 + 44), (0, 0, 255), 2)
+    else:
+        cv2.rectangle(hud_overlay, (mc_bx1, mc_by1), (mc_bx2, mc_by2), (35, 35, 35), -1)
+        cv2.rectangle(frame, (mc_bx1, mc_by1), (mc_bx2, mc_by2), (90, 90, 90), 2)
+        cv2.putText(frame, "CLICK USING MOUTH: OFF", (mc_bx1 + 10, (mc_by1 + mc_by2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 160, 160), 1, cv2.LINE_AA)
+
+    # 2. 4 Scroll Buttons (Right Side)
+    def render_scroll_button(y1, y2, is_active, active_bg=(0, 220, 0)):
         if is_active:
-            cv2.rectangle(btn_overlay, (btn_x1, y1), (btn_x2, y2), active_bg, -1)
+            cv2.rectangle(hud_overlay, (btn_x1, y1), (btn_x2, y2), active_bg, -1)
             border_c = (0, 255, 0) if active_bg == (0, 220, 0) else (0, 255, 255)
             thick = 3
             text_c = (0, 0, 0)
         else:
-            cv2.rectangle(btn_overlay, (btn_x1, y1), (btn_x2, y2), (80, 40, 0), -1)
+            cv2.rectangle(hud_overlay, (btn_x1, y1), (btn_x2, y2), (80, 40, 0), -1)
             border_c = (255, 180, 0)
             thick = 2
             text_c = (255, 255, 255)
         return border_c, thick, text_c
 
-    fup_bc, fup_th, fup_tc     = render_button(fup_y1, fup_y2, is_fast_up, active_bg=(0, 230, 255))
-    sup_bc, sup_th, sup_tc     = render_button(sup_y1, sup_y2, is_slow_up, active_bg=(0, 220, 0))
-    sdown_bc, sdown_th, sdown_tc = render_button(sdown_y1, sdown_y2, is_slow_down, active_bg=(0, 220, 0))
-    fdown_bc, fdown_th, fdown_tc = render_button(fdown_y1, fdown_y2, is_fast_down, active_bg=(0, 165, 255))
+    fup_bc, fup_th, fup_tc     = render_scroll_button(fup_y1, fup_y2, is_fast_up, active_bg=(0, 230, 255))
+    sup_bc, sup_th, sup_tc     = render_scroll_button(sup_y1, sup_y2, is_slow_up, active_bg=(0, 220, 0))
+    sdown_bc, sdown_th, sdown_tc = render_scroll_button(sdown_y1, sdown_y2, is_slow_down, active_bg=(0, 220, 0))
+    fdown_bc, fdown_th, fdown_tc = render_scroll_button(fdown_y1, fdown_y2, is_fast_down, active_bg=(0, 165, 255))
 
-    cv2.addWeighted(btn_overlay, 0.45, frame, 0.55, 0, frame)
+    cv2.addWeighted(hud_overlay, 0.45, frame, 0.55, 0, frame)
 
-    cv2.rectangle(frame, (btn_x1, fup_y1), (btn_x2, fup_y2), fup_bc, fup_th)
-    cv2.rectangle(frame, (btn_x1, sup_y1), (btn_x2, sup_y2), sup_bc, sup_th)
-    cv2.rectangle(frame, (btn_x1, sdown_y1), (btn_x2, sdown_y2), sdown_bc, sdown_th)
     cv2.rectangle(frame, (btn_x1, fdown_y1), (btn_x2, fdown_y2), fdown_bc, fdown_th)
+    cv2.rectangle(frame, (btn_x1, sdown_y1), (btn_x2, sdown_y2), sdown_bc, sdown_th)
+    cv2.rectangle(frame, (btn_x1, sup_y1), (btn_x2, sup_y2), sup_bc, sup_th)
+    cv2.rectangle(frame, (btn_x1, fup_y1), (btn_x2, fup_y2), fup_bc, fup_th)
 
-    cv2.putText(frame, "FAST UP", (btn_x1 + 16, (fup_y1 + fup_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.48, fup_tc, 2, cv2.LINE_AA)
-    cv2.putText(frame, "SLOW UP", (btn_x1 + 16, (sup_y1 + sup_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.48, sup_tc, 2, cv2.LINE_AA)
-    cv2.putText(frame, "[ NEUTRAL ]", (btn_x1 + 10, (sup_y2 + sdown_y1) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 140), 1, cv2.LINE_AA)
-    cv2.putText(frame, "SLOW DOWN", (btn_x1 + 10, (sdown_y1 + sdown_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, sdown_tc, 2, cv2.LINE_AA)
-    cv2.putText(frame, "FAST DOWN", (btn_x1 + 10, (fdown_y1 + fdown_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, fdown_tc, 2, cv2.LINE_AA)
+    cv2.putText(frame, "FAST DOWN", (btn_x1 + 8, (fdown_y1 + fdown_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, fdown_tc, 2, cv2.LINE_AA)
+    cv2.putText(frame, "SLOW DOWN", (btn_x1 + 8, (sdown_y1 + sdown_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.42, sdown_tc, 2, cv2.LINE_AA)
+    cv2.putText(frame, "[ NEUTRAL ]", (btn_x1 + 8, (sdown_y2 + sup_y1) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (140, 140, 140), 1, cv2.LINE_AA)
+    cv2.putText(frame, "SLOW UP", (btn_x1 + 14, (sup_y1 + sup_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, sup_tc, 2, cv2.LINE_AA)
+    cv2.putText(frame, "FAST UP", (btn_x1 + 14, (fup_y1 + fup_y2) // 2 + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, fup_tc, 2, cv2.LINE_AA)
 
     # Hand Skeleton & Pointer Marker
     if hand_found and index_tip is not None:
@@ -730,81 +781,138 @@ while cap.isOpened():
         cv2.putText(frame, "POINTER", (tip_px_x + 15, tip_px_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
     # --------------------------------------------------------------------------
-    # STEP G: PRANK MODE MEME CAT OVERLAYS & ALERTS
+    # STEP G: RENDER WARNING BANNERS & INVERSE ATTENTION HUD
     # --------------------------------------------------------------------------
-    if prank_active:
-        # 1. SNEEZE / JERK RESTART OVERLAY (Highest priority)
-        if current_time < jerk_alert_until:
-            cv2.rectangle(frame, (15, 15), (frame_w - 15, 80), (0, 0, 200), -1)
-            cv2.putText(frame, "EMOTION DETECTED! RESTARTING VIDEO!", (25, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, "VIDEO RESTARTED TO 0:00 (NO JERKS / SNEEZING)", (25, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 255, 255), 1, cv2.LINE_AA)
+    # 1. AD REWIND TAX PENALTY BANNER (During Ad Mode)
+    if ad_mode_active and current_time < ad_penalty_banner_until and ad_penalty_banner_text:
+        banner_h = 68
+        banner_y1 = 44
+        banner_y2 = banner_y1 + banner_h
 
-            shock_sz = int(min(frame_w, frame_h) * 0.45)
-            frame = overlay_png(frame, shocked_cat_img, frame_w // 2 - shock_sz // 2, frame_h // 2 - shock_sz // 2, shock_sz, shock_sz, fallback_label="SCREAMING CAT")
+        overlay_banner = frame.copy()
+        cv2.rectangle(overlay_banner, (10, banner_y1), (frame_w - 10, banner_y2), (0, 0, 220), -1)
+        cv2.addWeighted(overlay_banner, 0.90, frame, 0.10, 0, frame)
+        cv2.rectangle(frame, (10, banner_y1), (frame_w - 10, banner_y2), (0, 255, 255), 2)
 
-        # 2. LOOKING AWAY: WARNING & JUDGE MEME CAT
-        elif video_state == "PAUSED":
-            # Red Header Warning Banner: LOOK AT THE SCREEN!
-            cv2.rectangle(frame, (15, 15), (frame_w - 15, 80), (0, 0, 230), -1)
-            cv2.putText(frame, "LOOK AT THE SCREEN!", (30, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(frame, "VIDEO PAUSED! LOOK BACK TO RESUME PLAYBACK", (30, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (200, 255, 255), 1, cv2.LINE_AA)
+        font_scale = 0.46 if len(ad_penalty_banner_text) > 42 else 0.54
+        text_size = cv2.getTextSize(ad_penalty_banner_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 2)[0]
+        text_x = max(16, (frame_w - text_size[0]) // 2)
+        cv2.putText(frame, ad_penalty_banner_text, (text_x, banner_y1 + 42), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 2, cv2.LINE_AA)
 
-            cat_sz = int(min(frame_w, frame_h) * 0.40)
-            frame = overlay_png(frame, judge_cat_img, 30, frame_h - cat_sz - 30, cat_sz, cat_sz, fallback_label="LOOK AT SCREEN CAT")
+    # 2. INVERSE ATTENTION TRAP HUD STATUS (GREEN / RED)
+    if inverse_attention_trap and not ad_mode_active:
+        if gaze_buffered_state == "AWAY":
+            hud_gaze_text = "LOOKING AWAY: PLAYING (GOOD)"
+            hud_gaze_bg = (0, 140, 0)
+            hud_gaze_border = (0, 255, 0)
+            hud_text_color = (255, 255, 255)
+        else:
+            hud_gaze_text = "LOOKING AT SCREEN FORBIDDEN! PAUSED"
+            hud_gaze_bg = (0, 0, 180)
+            hud_gaze_border = (0, 0, 255)
+            hud_text_color = (255, 255, 255)
 
-        # 3. LOOKED BACK: HAPPY MEME CAT POPUP
-        elif current_time < happy_cat_until:
-            cv2.rectangle(frame, (15, 15), (frame_w - 15, 65), (0, 180, 0), -1)
-            cv2.putText(frame, "GOOD! KEEP WATCHING!", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.70, (255, 255, 255), 2, cv2.LINE_AA)
+        banner_y1 = 40
+        banner_y2 = 72
+        overlay_gaze = frame.copy()
+        cv2.rectangle(overlay_gaze, (10, banner_y1), (frame_w - 10, banner_y2), hud_gaze_bg, -1)
+        cv2.addWeighted(overlay_gaze, 0.85, frame, 0.15, 0, frame)
+        cv2.rectangle(frame, (10, banner_y1), (frame_w - 10, banner_y2), hud_gaze_border, 2)
 
-            happy_sz = int(min(frame_w, frame_h) * 0.35)
-            frame = overlay_png(frame, happy_cat_img, 30, frame_h - happy_sz - 30, happy_sz, happy_sz, fallback_label="HAPPY CAT")
+        ts = cv2.getTextSize(hud_gaze_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)[0]
+        tx = max(15, (frame_w - ts[0]) // 2)
+        cv2.putText(frame, hud_gaze_text, (tx, banner_y1 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, hud_text_color, 2, cv2.LINE_AA)
 
     # --------------------------------------------------------------------------
-    # STEP H: HUD SYSTEM READOUTS
+    # STEP H: TOP STATUS BAR & HUD READOUTS
     # --------------------------------------------------------------------------
-    prank_status_text = "PRANK MODE: ACTIVE" if prank_active else "PRANK MODE: OFF"
-    prank_status_color = (0, 255, 0) if prank_active else (140, 140, 140)
-    cv2.putText(frame, f"{prank_status_text} (Press 'r' to toggle)", (20, frame_h - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.48, prank_status_color, 1, cv2.LINE_AA)
+    top_bar_h = 36
+    overlay_top = frame.copy()
+    if fullscreen_inversion:
+        cv2.rectangle(overlay_top, (0, 0), (frame_w, top_bar_h), (0, 0, 180), -1)
+        status_title = "FULLSCREEN TRAP: UPSIDE DOWN (Press 'F'/'Esc' to reset)"
+        status_color = (0, 255, 255)
+    elif ad_mode_active:
+        cv2.rectangle(overlay_top, (0, 0), (frame_w, top_bar_h), (0, 80, 180), -1)
+        status_title = f"AD MODE: ACTIVE | STRIKES: {ad_strikes}/3"
+        status_color = (0, 255, 255)
+    elif inverse_attention_trap:
+        cv2.rectangle(overlay_top, (0, 0), (frame_w, top_bar_h), (0, 100, 150), -1)
+        status_title = f"INVERSE ATTENTION: ON ({video_state})"
+        status_color = (0, 255, 255)
+    elif is_youtube_active():
+        cv2.rectangle(overlay_top, (0, 0), (frame_w, top_bar_h), (0, 0, 150), -1)
+        status_title = f"YOUTUBE: ACTIVE ({video_state})"
+        status_color = (0, 255, 255)
+    else:
+        cv2.rectangle(overlay_top, (0, 0), (frame_w, top_bar_h), (35, 35, 35), -1)
+        status_title = "SYSTEM: READY"
+        status_color = (180, 180, 180)
 
-    gaze_label = "LOOKING AT SCREEN (PLAYING)" if raw_looking_at_screen else "LOOKING AWAY (PAUSED)"
-    gaze_color = (0, 255, 0) if raw_looking_at_screen else (0, 0, 255)
-    cv2.putText(frame, f"Gaze: {gaze_label}", (20, frame_h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.46, gaze_color, 1, cv2.LINE_AA)
+    cv2.addWeighted(overlay_top, 0.70, frame, 0.30, 0, frame)
+    cv2.putText(frame, status_title, (15, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, status_color, 2, cv2.LINE_AA)
+    cv2.putText(frame, "[M: Mouth | I: Inverse | A: Ad | F: Flip]", (frame_w - 320, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
 
-    cv2.putText(frame, f"Scroll: {scroll_status_text}", (20, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.50, scroll_status_color, 1, cv2.LINE_AA)
+    # Bottom status readouts
+    gaze_label = "LOOKING AT SCREEN (PAUSED)" if gaze_buffered_state == "LOOKING" else "LOOKING AWAY: (PLAYING)"
+    gaze_color = (0, 0, 255) if gaze_buffered_state == "LOOKING" else (0, 255, 0)
+    cv2.putText(frame, f"Gaze: {gaze_label}", (20, frame_h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.40, gaze_color, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Scroll: {scroll_status_text}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.45, scroll_status_color, 1, cv2.LINE_AA)
 
-    # Rotate the complete preview while keeping the punishment banner readable.
+    # --------------------------------------------------------------------------
+    # STEP I: WEBCAM PREVIEW INVERSION & WARNING BANNER
+    # --------------------------------------------------------------------------
+    # FEATURE 1: Flip preview upside down during fullscreen punishment
     display_frame = cv2.rotate(frame, cv2.ROTATE_180) if fullscreen_inversion else frame
+
     if fullscreen_inversion:
         banner_text = "FULLSCREEN PRIVILEGES REVOKED. ENJOY UPSIDE DOWN."
-        banner_scale = 0.62
+        banner_scale = 0.52
         banner_thickness = 2
-        text_size = cv2.getTextSize(
-            banner_text, cv2.FONT_HERSHEY_SIMPLEX, banner_scale, banner_thickness
-        )[0]
+        text_size = cv2.getTextSize(banner_text, cv2.FONT_HERSHEY_SIMPLEX, banner_scale, banner_thickness)[0]
         banner_x = max(10, (frame_w - text_size[0]) // 2)
-        cv2.rectangle(display_frame, (10, 12), (frame_w - 10, 68), (20, 20, 190), -1)
+        cv2.rectangle(display_frame, (10, 8), (frame_w - 10, 58), (0, 0, 220), -1)
+        cv2.rectangle(display_frame, (10, 8), (frame_w - 10, 58), (0, 255, 255), 2)
         cv2.putText(
-            display_frame, banner_text, (banner_x, 50), cv2.FONT_HERSHEY_SIMPLEX,
+            display_frame, banner_text, (banner_x, 40), cv2.FONT_HERSHEY_SIMPLEX,
             banner_scale, (255, 255, 255), banner_thickness, cv2.LINE_AA
         )
 
-    # Show live webcam debug feed window
+    # Show live webcam feed window
     cv2.imshow(window_name, display_frame)
 
     # Keyboard controls
     key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
+    if key == ord('q') or key == ord('Q'):
         print("[*] Exit requested by user. Terminating tracking...")
         break
-    elif key == 27:
-        update_fullscreen_inversion(False)
+    elif key == ord('m') or key == ord('M'):
+        mouth_click_enabled = not mouth_click_enabled
+        print(f"[*] MOUTH-OPEN CLICK GESTURE: {'ENABLED' if mouth_click_enabled else 'DISABLED'}")
+    elif key == ord('i') or key == ord('I'):
+        inverse_attention_trap = not inverse_attention_trap
+        print(f"[*] INVERSE ATTENTION TRAP (Look Away to Play): {'ON' if inverse_attention_trap else 'OFF'}")
+    elif key == ord('f') or key == ord('F'):
+        # Toggle Fullscreen Inversion Trap
+        update_fullscreen_inversion(not fullscreen_inversion)
+    elif key == 27:  # Escape key
+        if fullscreen_inversion:
+            update_fullscreen_inversion(False)
+    elif key == ord('a') or key == ord('A'):
+        ad_mode_active = not ad_mode_active
+        if not ad_mode_active:
+            ad_strikes = 0
+            ad_not_looking_start = 0.0
+            ad_penalty_banner_text = ""
+        print(f"[*] YOUTUBE AD REWIND TAX MODE TOGGLED: {'ACTIVE' if ad_mode_active else 'OFF'}")
     elif key == ord('r') or key == ord('R'):
-        prank_active = not prank_active
-        print(f"[*] YOUTUBE PRANK MODE TOGGLED: {'ACTIVE' if prank_active else 'OFF'}")
+        send_youtube_play_pause()
+        video_state = "PLAYING" if video_state == "PAUSED" else "PAUSED"
+        last_gaze_toggle_time = current_time
+        print(f"[*] MANUAL RESYNC: Toggled playback state to {video_state}")
 
 # ------------------------------------------------------------------------------
-# 10. CLEANUP & RELEASE RESOURCES
+# 11. CLEANUP & RELEASE RESOURCES
 # ------------------------------------------------------------------------------
 update_fullscreen_inversion(False)
 cap.release()
