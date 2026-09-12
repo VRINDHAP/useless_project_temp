@@ -73,8 +73,8 @@ python main.py
 | Key | Action |
 |---|---|
 | `M` | Toggle Mouth-Click Control |
-| `I` | Toggle Inverse-Attention Trap (Pause on Look-Away) |
-| `A` | Toggle YouTube Ad Rewind Tax Mode |
+| `I` | Toggle Inverse-Attention Trap (Pause when Looking, Play when Looking Away) |
+| `A` | Toggle YouTube Ad Mode (Resume when Looking, Pause/Rewind when Looking Away) |
 | `F` / `Esc` | Toggle or Exit Fullscreen Display Inversion |
 | `R` | Resync / Recenter Cursor Tracking |
 | `Q` | Quit LookAway |
